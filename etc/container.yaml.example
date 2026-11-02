@@ -1,0 +1,59 @@
+# Safe starting point for a passive, single-router collector.
+# Mount a customised copy at /etc/argus/config.yaml (read-only).
+collectors:
+  netflow:
+    config:
+      bindaddr: "0.0.0.0"
+      bindport: "2055"
+      debug: "false"
+
+enrich: "geoip"
+maxmind:
+  # Preload BOTH files below; no downloads/license credentials in this image.
+  # A separate read-only mount over /data/geoip is supported.
+  enabled: false
+  db_path: /data/geoip
+  editions: [GeoLite2-ASN, GeoLite2-City]
+
+bgp:
+  bgp_listener:
+    enabled: false
+routeros:
+  enabled: false
+snmp:
+  enabled: false
+cfm:
+  enabled: false
+detection:
+  enable_detection_engine: false
+flowlog:
+  enabled: false
+  db_path: /data/flows.sqlite
+
+# Set these to your actual local CIDRs and WAN interface indexes. ASN 0 here
+# means 'unspecified', not a real ASN assigned to your network.
+my_asn: 0
+my_prefixes: []
+upstream_interfaces: []
+
+# API IP trust grants administrative access, not just network reachability.
+# Keep loopback only until independent ingress authentication is configured;
+# do not blindly allow the pod/LAN subnet or an unauthenticated ingress peer.
+api:
+  listen_address: "0.0.0.0"
+  port: 9600
+  allow_ips: ["127.0.0.1", "::1"]
+  tokens: []
+  mcp_enabled: false
+
+# Browser auth is off in this baseline; set db_path=/data/auth.db and provide
+# a stable GOAUTH_MFA_ENCRYPTION_KEY to enable it. All writable DBs belong in /data.
+auth:
+  db_path: ""
+  session_db_path: /data/auth_sessions.db
+  secure_cookie: true
+
+# Point PTR queries at your internal resolver if you use IP-profile lookups.
+# Omitting 'ptr' from enrich does not disable every on-demand DNS lookup.
+dns:
+  nameserver: "127.0.0.1"

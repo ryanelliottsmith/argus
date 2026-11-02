@@ -1,0 +1,17 @@
+# Allowlist the build inputs; never send local config, credentials or DBs.
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!LICENSE
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!etc/
+!etc/container.yaml.example
+
+# Tests/fixtures are not required to build the application.
+**/*_test.go
+**/testdata/

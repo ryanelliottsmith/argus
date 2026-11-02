@@ -8,6 +8,12 @@ Every behavior-changing PR must add an entry under **Unreleased**.
 ## [Unreleased]
 
 ### Added
+- **Minimal non-root container build.** Multi-stage Dockerfile with static Go
+  binary and distroless runtime, default UID/GID 65532, overridable numeric IDs,
+  read-only root/config/GeoIP support and `/data` for writable state. Includes
+  a passive container configuration, build-context allowlist, deployment and
+  Kubernetes hardening notes, and offline OCI smoke tests for default/custom
+  users, SQLite/auth/flowlog, dropped capabilities and SIGTERM shutdown.
 - **`smtp_egress_fanout` detection rule** (alert-only). It fires when one of our
   hosts sends to ≥30 distinct remote MXs on TCP/25 (≥40 flows) within 60s,
   which points to a compromised box or a customer VPS sending bulk mail. For

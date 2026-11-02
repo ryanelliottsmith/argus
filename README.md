@@ -6,6 +6,13 @@ Processes live traffic from MikroTik (and other) routers, enriches flows with AS
 
 ---
 
+## Container build
+
+A multi-stage [Dockerfile](Dockerfile) produces a shell-free, non-root image.
+It supports a read-only root filesystem and custom numeric UID/GID with writable
+state under `/data`. See [container deployment and hardening](docs/container.md)
+for the passive example configuration, Docker/Kubernetes settings and smoke test.
+
 ## Architecture
 
 ```
