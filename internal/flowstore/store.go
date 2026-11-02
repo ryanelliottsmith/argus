@@ -216,10 +216,16 @@ type metaAccum struct {
 type Store struct {
 	mu sync.Mutex
 
-	// 5-min timeline accumulators — flushed and reset every 5 min.
+	// Serializes writers and protects retry snapshots, never held by ingestion.
+	flushMu         sync.Mutex
+	pendingTimeline map[tlKey]*tlVal
+	pendingMeta     map[uint32]metaDelta
+	pendingDetails  map[detailKey]*detailAccum
+
+	// 5-min timeline accumulators — only closed buckets are drained.
 	tl map[tlKey]*tlVal
 
-	// 30-min detail accumulators — flushed and reset every 30 minutes.
+	// 30-min detail accumulators — only closed buckets are drained on each tick.
 	details map[detailKey]*detailAccum
 
 	// Permanent ASN metadata — never reset, written as deltas on each 5-min flush.
@@ -353,12 +359,14 @@ func (s *Store) Accumulate(rec *FlowEvent) {
 		return
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Choose the bucket under the same lock used to detach closed buckets.
+	// An ingestion waiting across a boundary must not recreate a flushed bucket.
 	now := time.Now()
 	ts5 := (now.Unix() / 300) * 300
 	tsDetail := (now.Unix() / 1800) * 1800
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// ── meta ──────────────────────────────────────────────────────────────────
 	m := s.meta[peerASN]

@@ -142,16 +142,35 @@ func initSchema(db *sql.DB) error {
 
 // ── flush5m ───────────────────────────────────────────────────────────────────
 
-// flush5m drains the timeline accumulator and writes it to SQLite.
-// Also writes ASN meta deltas. Called every 5 minutes.
+// flush5m writes only closed timeline buckets, plus current ASN meta deltas.
+// Tickers are startup-relative, so each tick can fall inside an open bucket.
 func (s *Store) flush5m() error {
-	s.mu.Lock()
-	tl := s.tl
-	deltas := s.drainMetaDeltas()
-	s.tl = make(map[tlKey]*tlVal)
-	s.mu.Unlock()
+	return s.flush5mBefore(time.Now().Unix() / 300 * 300)
+}
+
+// flush5mBefore flushes buckets strictly older than the aligned cutoff.
+func (s *Store) flush5mBefore(cutoff int64) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	// Keep a detached snapshot until COMMIT succeeds. Retrying it must not
+	// drain new meta deltas or mutate counters still used by ingestion.
+	if s.pendingTimeline == nil {
+		s.mu.Lock()
+		s.pendingTimeline = make(map[tlKey]*tlVal)
+		for k, v := range s.tl {
+			if k.ts < cutoff {
+				s.pendingTimeline[k] = v
+				delete(s.tl, k)
+			}
+		}
+		s.pendingMeta = s.drainMetaDeltas()
+		s.mu.Unlock()
+	}
+	tl, deltas := s.pendingTimeline, s.pendingMeta
 
 	if len(tl) == 0 && len(deltas) == 0 {
+		s.pendingTimeline, s.pendingMeta = nil, nil
 		return nil
 	}
 
@@ -188,11 +207,11 @@ func (s *Store) flush5m() error {
 			k.ts, k.asn, v.asnName, k.dir,
 			v.bytes, v.packets, v.flows,
 		); err != nil {
-			log.Printf("[flowstore] flush5m timeline row: %v", err)
+			return err
 		}
 		for iface, b := range v.ifaces {
 			if _, err := ifStmt.Exec(k.ts, k.asn, k.dir, iface, b); err != nil {
-				log.Printf("[flowstore] flush5m iface row: %v", err)
+				return err
 			}
 		}
 	}
@@ -221,11 +240,15 @@ func (s *Store) flush5m() error {
 		if _, err := metaStmt.Exec(
 			asn, d.asnName, d.firstSeen, d.lastSeen, d.deltaIn, d.deltaOut,
 		); err != nil {
-			log.Printf("[flowstore] flush5m meta row: %v", err)
+			return err
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.pendingTimeline, s.pendingMeta = nil, nil
+	return nil
 }
 
 // drainMetaDeltas snapshots pending byte deltas from s.meta and resets them.
@@ -254,15 +277,29 @@ func (s *Store) drainMetaDeltas() map[uint32]metaDelta {
 
 // ── flushDetail ───────────────────────────────────────────────────────────────
 
-// flushDetail drains the 30-min detail accumulators and writes top-N records
-// to the detail tables. Called every 30 minutes.
+// flushDetail writes top-N records only after their 30-min bucket has closed.
 func (s *Store) flushDetail() error {
-	s.mu.Lock()
-	details := s.details
-	s.details = make(map[detailKey]*detailAccum)
-	s.mu.Unlock()
+	return s.flushDetailBefore(time.Now().Unix() / 1800 * 1800)
+}
+
+func (s *Store) flushDetailBefore(cutoff int64) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if s.pendingDetails == nil {
+		s.mu.Lock()
+		s.pendingDetails = make(map[detailKey]*detailAccum)
+		for k, v := range s.details {
+			if k.ts < cutoff {
+				s.pendingDetails[k] = v
+				delete(s.details, k)
+			}
+		}
+		s.mu.Unlock()
+	}
+	details := s.pendingDetails
 
 	if len(details) == 0 {
+		s.pendingDetails = nil
 		return nil
 	}
 
@@ -274,26 +311,30 @@ func (s *Store) flushDetail() error {
 
 	for hk, ha := range details {
 		if err := writeTopIPs(tx, hk, ha, s.limits.TopIPs); err != nil {
-			log.Printf("[flowstore] flushDetail ips asn=%d: %v", hk.asn, err)
+			return err
 		}
 		if err := writeTopPrefixes(tx, hk, ha, s.limits.TopPrefixes); err != nil {
-			log.Printf("[flowstore] flushDetail pfx asn=%d: %v", hk.asn, err)
+			return err
 		}
 		if err := writeProto(tx, hk, ha); err != nil {
-			log.Printf("[flowstore] flushDetail proto asn=%d: %v", hk.asn, err)
+			return err
 		}
 		if err := writeCountry(tx, hk, ha); err != nil {
-			log.Printf("[flowstore] flushDetail country asn=%d: %v", hk.asn, err)
+			return err
 		}
 		if err := writePorts(tx, hk, ha, s.limits.TopPorts); err != nil {
-			log.Printf("[flowstore] flushDetail ports asn=%d: %v", hk.asn, err)
+			return err
 		}
 		if err := writeTCPFlags(tx, hk, ha); err != nil {
-			log.Printf("[flowstore] flushDetail flags asn=%d: %v", hk.asn, err)
+			return err
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.pendingDetails = nil
+	return nil
 }
 
 // ── Per-table writers ─────────────────────────────────────────────────────────

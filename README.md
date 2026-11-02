@@ -574,6 +574,18 @@ traffic is steady is your leak.
   `GET /debug/rollup?ip=<ip>` or `?asn=<n>&days=<n>`
 - `telemetry_*_buckets` — per-minute global/ASN/interface time series
 
+**Historical bucket persistence.** Flowstore keeps the current 5-minute timeline
+and 30-minute detail buckets in memory until they close, then writes them on the
+next respective flush tick. SQL history therefore excludes the open bucket and
+can lag its closure by up to another 5 or 30 minutes. Top-N is selected from the
+whole observed detail bucket rather than tick-sized fragments. Failed writes are
+retried atomically without dropping the detached batch or double-counting ASN
+metadata; sustained storage failures can increase RAM use. Uncommitted buckets
+and retry batches are not durable across restarts, and this fix cannot recover
+partial history previously overwritten by older versions. When upgrading an old
+installation, the bucket spanning the restart can remain incomplete; lifetime
+ASN metadata is flushed separately and can exceed the retained detail totals.
+
 **Raw flow log** (`flows.sqlite`, optional — off by default) — the forensic
 store. When `flowlog.enabled: true`, every enriched flow (5-tuple + bytes,
 packets, interfaces, ASNs, direction) is appended to a dedicated SQLite file and

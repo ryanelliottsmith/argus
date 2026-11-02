@@ -98,6 +98,13 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   is reclaimed with a one-time `VACUUM` (see README → Storage / disk).
 
 ### Fixed
+- **Historical flowstore bucket totals were overwritten at non-boundary ticks.**
+  Keep open 5-minute timeline/interface and 30-minute detail buckets in memory
+  until closed, selecting top-N from the whole observed detail bucket. Failed
+  SQL flushes now retain their snapshots for atomic retry, and lifetime ASN
+  deltas are applied once. Open buckets appear in SQL only after the next
+  post-closure flush; uncommitted RAM and legacy overwritten data are not
+  recoverable across restarts (see Storage and logs).
 - **Collection without BGP enrichment.** Startup no longer dereferences a
   disabled BGP listener. Missing flow ASN numbers fall back to the local
   MaxMind database, while exporter- and BGP-supplied ASNs retain precedence.
