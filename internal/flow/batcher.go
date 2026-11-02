@@ -121,6 +121,19 @@ func (b *FlowEnricher) enrichAndFeed(batch []*FlowRecord) {
 		if b.ranger != nil {
 			b.enrichBGP(rec)
 		}
+		// Exporter/BGP ASNs take precedence. With neither available, use the
+		// local MMDB so ASN-based telemetry and flowstore still receive flows.
+		if b.geo != nil {
+			if rec.PeerSrcAS == 0 {
+				rec.PeerSrcAS = b.geo.GetASNNumber(rec.SrcHost)
+			}
+			if rec.PeerDstAS == 0 {
+				rec.PeerDstAS = b.geo.GetASNNumber(rec.DstHost)
+			}
+			if rec.DstAS == 0 {
+				rec.DstAS = rec.PeerDstAS
+			}
+		}
 	}
 
 	// ── Telemetry tap ──────────────────────────────────────────────────────

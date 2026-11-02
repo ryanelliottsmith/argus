@@ -565,11 +565,16 @@ func main() {
 	}
 
 	// ── Flow pipeline ─────────────────────────────────────────────────────────
+	// The batcher supports a nil ranger when BGP enrichment is disabled.
+	var batchRanger cidranger.Ranger
+	if listener != nil {
+		batchRanger = listener.Ranger
+	}
 	batcher := flow.NewInsertFlowBatcher(
 		nil,                   // no inserter needed
 		200,                   // batch size (or cfg.Enrich.BatchSize)
 		1000*time.Millisecond, // flush interval (or cfg.Enrich.FlushIntervalMs)
-		listener.Ranger,
+		batchRanger,
 		ifNameCache,
 		cfg.BGP.Listener.StoreASPath,
 		geo,

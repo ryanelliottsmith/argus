@@ -98,6 +98,11 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   is reclaimed with a one-time `VACUUM` (see README → Storage / disk).
 
 ### Fixed
+- **Collection without BGP enrichment.** Startup no longer dereferences a
+  disabled BGP listener. Missing flow ASN numbers fall back to the local
+  MaxMind database, while exporter- and BGP-supplied ASNs retain precedence.
+  Regression tests exercise real startup/shutdown without a BGP peer and
+  local-only ASN enrichment using bundled synthetic MMDB fixtures.
 - **Egress rules with `unique_dst_ips` could never match.** A check meant for
   ingress rules dropped every flow whose destination was not ours, which is
   every egress flow. `data_exfil_multi_dst` was silently dead because of it,
