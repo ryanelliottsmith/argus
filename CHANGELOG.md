@@ -8,6 +8,12 @@ Every behavior-changing PR must add an entry under **Unreleased**.
 ## [Unreleased]
 
 ### Added
+- **Opt-in startup GeoIP synchronization.** `MAXMIND_UPDATE_ON_START=true`
+  checks/downloads MaxMind databases before readers open, using runtime
+  `MAXMIND_ACCOUNT_ID` / `MAXMIND_LICENSE_KEY` secrets. Persisted check/release
+  metadata throttles repeat startup requests and skips unchanged archives.
+  Valid cached databases survive update failures; a missing unusable pair fails
+  startup. No shell wrapper or additional runtime tools are required.
 - **Minimal non-root container build.** Multi-stage Dockerfile with static Go
   binary and distroless runtime, default UID/GID 65532, overridable numeric IDs,
   read-only root/config/GeoIP support and `/data` for writable state. Includes

@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", default="docker")
     parser.add_argument("--image", default="argus:test")
+    parser.add_argument("--startup-update-cached", action="store_true",
+                        help="exercise opt-in startup sync using cached DBs, with no download credentials")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
 
@@ -59,6 +61,8 @@ def main():
                 "--mount", f"type=bind,src={fixture_dir},dst=/data/geoip,ro",
                 "--env", "GOAUTH_MFA_ENCRYPTION_KEY=" + secrets.token_hex(32),
             ]
+            if args.startup_update_cached:
+                command += ["--env", "MAXMIND_UPDATE_ON_START=true"]
             if is_podman:
                 # Avoid Podman's automatic extra writable tmpfs mounts and
                 # automatic passwd entries, so tests exercise the image itself.
@@ -83,6 +87,8 @@ def main():
                     raise RuntimeError("daemon never reached API startup")
 
                 assert state["HostConfig"]["ReadonlyRootfs"]
+                if args.startup_update_cached:
+                    assert "[maxmind] startup update check" in logs.stdout + logs.stderr
                 mounts = {mount["Destination"]: mount for mount in state["Mounts"]}
                 for destination in ("/etc/argus/config.yaml", "/data/geoip"):
                     assert not mounts[destination]["RW"], destination + " mount is writable"

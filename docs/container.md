@@ -70,13 +70,96 @@ A read-only root still needs a writable `/data` directory: SQLite requires its
 Back up persistent state with the application stopped or SQLite-aware tooling.
 
 To keep collector Internet egress blocked, preload both MaxMind databases and
-leave `maxmind.enabled: false`. An external updater can replace them; restart
-Argus afterwards to reopen readers. If you enable its built-in updater, that
-GeoIP directory must instead be writable and network access/credentials must be
-provided. Removing `ptr` from `enrich` is not a universal DNS-disable switch;
-ASN profile pages also have the external lookup described in the code review.
+leave both `maxmind.enabled` and `maxmind.update_on_start` false (and do not set
+`MAXMIND_UPDATE_ON_START=true`). An external updater can replace them; restart
+Argus afterwards to reopen readers. The opt-in startup updater below is an
+alternative that checks/downloads before readers open. Removing `ptr` from
+`enrich` is not a universal DNS-disable switch; ASN profile pages also have the
+external lookup described in the code review.
 The current dashboard still uses browser-loaded CDN scripts; a shell-free image
 and pod policy do not make the UI fully offline or contain browser requests.
+
+## Startup GeoIP updates
+
+The existing Go entrypoint can perform an **opt-in startup sync**, before opening
+GeoIP readers. No shell/curl wrapper, extra image tools, root privileges or
+configuration rewriting are needed. Enable it with these runtime environment
+variables (use a Kubernetes Secret for the credentials):
+
+```yaml
+env:
+  - name: MAXMIND_UPDATE_ON_START
+    value: "true"
+  - name: MAXMIND_ACCOUNT_ID
+    valueFrom:
+      secretKeyRef:
+        name: argus-maxmind
+        key: account-id
+  - name: MAXMIND_LICENSE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: argus-maxmind
+        key: license-key
+```
+
+The equivalent YAML configuration is:
+
+```yaml
+maxmind:
+  enabled: false       # keep the legacy background downloader off
+  update_on_start: true
+  db_path: /data/geoip
+  editions: [GeoLite2-ASN, GeoLite2-City]
+  check_every: 24h
+  http_timeout: 30s
+```
+
+Environment credentials override YAML credentials; the startup flag environment
+variable overrides `update_on_start`. Credentials alone do not enable downloads.
+Keep `/data/geoip` **writable and persistent** in this mode: either use its
+normal location in the `/data` PVC or a separately writable volume. Do not use
+the read-only GeoIP bind mount from the offline Docker example below. Root and
+configuration files can remain read-only, and numeric UID/GID overrides and
+capability dropping still work. Never put a license key in an image build arg.
+
+On first startup, missing databases are downloaded and validated. On later
+startups, persisted per-edition check times avoid HTTP requests within
+`check_every` (24 hours by default). When a check is due, authenticated **HEAD**
+requests inspect release metadata; an unchanged release avoids the archive
+**GET**. Installed remote metadata is recorded only after a successful install,
+so a failed download can be retried. Missing/corrupt databases bypass the check
+interval. Downloads are staged, validated and renamed atomically rather than
+writing over a database being used. Credentials are not stored in update metadata
+or written to logs.
+
+If updating fails but both cached databases are still valid, startup warns and
+uses them. Without a usable pair, startup fails instead of claiming enrichment
+is ready. This policy prefers monitoring availability without hiding stale data;
+watch the `[maxmind]` startup logs. Metadata and MMDBs must survive pod replacement
+for the check cache to be effective.
+
+**This is startup-only, not scheduled refresh.** A long-running pod will not
+check again until restarted. To get automatic freshness over time, arrange
+controlled restarts or use an external updater plus a restart. Keep
+`maxmind.enabled: false`: its older background downloader does not reload open
+MMDB readers. Startup sync happens before readers open, so its newly installed
+files are actually used immediately.
+
+For Docker, export the credentials securely in the invoking environment and add
+`--env MAXMIND_UPDATE_ON_START=true --env MAXMIND_ACCOUNT_ID --env
+MAXMIND_LICENSE_KEY` to the hardened command, omitting the read-only GeoIP bind.
+For Cilium, allow actual DNS resolution and outbound TCP443 to:
+
+- `download.maxmind.com`
+- `mm-prod-geoip-databases.a2649acb697e2c09b632799562c076f2.r2.cloudflarestorage.com`
+
+The second host is MaxMind's documented HTTPS download redirect. HTTP Basic Auth
+is used for the MaxMind origin, not forwarded to an unrelated redirect host.
+Allowing just the first hostname is insufficient. See MaxMind's official
+[database update guidance](https://dev.maxmind.com/geoip/updating-databases/) for
+HEAD checks and current download hosts; HEAD checks do not count toward the
+archive download limit. These are destination requirements, not a tested Cilium
+manifest for your cluster.
 
 ## Hardened Docker run
 

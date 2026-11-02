@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -314,14 +315,15 @@ type AuthConfig struct {
 
 // Add this struct (alongside SNMPConfig, CFMConfig etc.)
 type MaxMindConfig struct {
-	Enabled     bool          `yaml:"enabled"`
-	AccountID   string        `yaml:"account_id"`
-	LicenseKey  string        `yaml:"license_key"`
-	DBPath      string        `yaml:"db_path"`
-	Editions    []string      `yaml:"editions"`
-	CheckEvery  time.Duration `yaml:"check_every"`
-	MinAge      time.Duration `yaml:"min_age"`
-	HTTPTimeout time.Duration `yaml:"http_timeout"`
+	Enabled       bool          `yaml:"enabled"`
+	UpdateOnStart bool          `yaml:"update_on_start"`
+	AccountID     string        `yaml:"account_id"`
+	LicenseKey    string        `yaml:"license_key"`
+	DBPath        string        `yaml:"db_path"`
+	Editions      []string      `yaml:"editions"`
+	CheckEvery    time.Duration `yaml:"check_every"`
+	MinAge        time.Duration `yaml:"min_age"`
+	HTTPTimeout   time.Duration `yaml:"http_timeout"`
 }
 
 func GetDefaultConfigPath() (string, error) {
@@ -360,6 +362,32 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("error parsing config file %s: %w", path, err)
+	}
+
+	// Container secrets stay in the runtime environment, not generated YAML or
+	// image layers. Explicit environment values override YAML, including empty
+	// credentials; credentials alone never enable network activity.
+	if value, ok := os.LookupEnv("MAXMIND_ACCOUNT_ID"); ok {
+		cfg.MaxMind.AccountID = value
+	}
+	if value, ok := os.LookupEnv("MAXMIND_LICENSE_KEY"); ok {
+		cfg.MaxMind.LicenseKey = value
+	}
+	if value, ok := os.LookupEnv("MAXMIND_UPDATE_ON_START"); ok {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("MAXMIND_UPDATE_ON_START must be true or false")
+		}
+		cfg.MaxMind.UpdateOnStart = enabled
+	}
+
+	if cfg.MaxMind.Enabled || cfg.MaxMind.UpdateOnStart {
+		if cfg.MaxMind.DBPath == "" {
+			cfg.MaxMind.DBPath = "/var/lib/argus/maxmind"
+		}
+		if len(cfg.MaxMind.Editions) == 0 {
+			cfg.MaxMind.Editions = []string{"GeoLite2-ASN", "GeoLite2-City"}
+		}
 	}
 
 	// Derive GeoIP paths from MaxMind config

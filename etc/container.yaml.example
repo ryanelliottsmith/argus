@@ -9,11 +9,16 @@ collectors:
 
 enrich: "geoip"
 maxmind:
-  # Preload BOTH files below; no downloads/license credentials in this image.
-  # A separate read-only mount over /data/geoip is supported.
-  enabled: false
+  # Offline by default. For startup downloads/updates, keep enabled=false and
+  # set MAXMIND_UPDATE_ON_START=true plus MAXMIND_ACCOUNT_ID/MAXMIND_LICENSE_KEY.
+  # Startup sync needs a writable persistent db_path; preloaded offline files
+  # can instead use a separate read-only mount here.
+  enabled: false # legacy background updater (does not reload open readers)
+  update_on_start: false # environment flag overrides this
   db_path: /data/geoip
   editions: [GeoLite2-ASN, GeoLite2-City]
+  check_every: 24h
+  http_timeout: 30s
 
 bgp:
   bgp_listener:

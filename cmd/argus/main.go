@@ -294,8 +294,22 @@ func main() {
 	}
 
 	// ── MaxMind preflight ─────────────────────────────────────────────────────
-	// Block until all .mmdb files exist. Downloads only what is missing.
-	if cfg.MaxMind.Enabled {
+	// Startup-only sync runs before readers open the MMDBs, so a newly installed
+	// release is used immediately without background reload races or shell tools.
+	if cfg.MaxMind.UpdateOnStart {
+		log.Printf("[maxmind] startup update check in %s ...", cfg.MaxMind.DBPath)
+		if err := maxmind.SyncAtStartup(ctx, maxmind.Config{
+			AccountID:   cfg.MaxMind.AccountID,
+			LicenseKey:  cfg.MaxMind.LicenseKey,
+			Editions:    cfg.MaxMind.Editions,
+			Dir:         cfg.MaxMind.DBPath,
+			CheckEvery:  cfg.MaxMind.CheckEvery,
+			HTTPTimeout: cfg.MaxMind.HTTPTimeout,
+		}, log.Printf); err != nil {
+			log.Fatalf("[maxmind] startup database sync failed: %v", err)
+		}
+	} else if cfg.MaxMind.Enabled {
+		// Legacy background-update mode bootstraps missing files only here.
 		log.Printf("[maxmind] checking db files in %s ...", cfg.MaxMind.DBPath)
 		if err := maxmind.EnsureDBs(maxmind.Config{
 			AccountID:   cfg.MaxMind.AccountID,

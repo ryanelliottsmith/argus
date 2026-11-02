@@ -20,14 +20,27 @@ import (
 // background goroutine cannot kill or contaminate the test runner. All data is
 // disposable and every optional network integration is disabled.
 func TestMainWithoutBGP(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("listener_enabled_%t", enabled), func(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		listenerEnabled bool
+		startupUpdate   bool
+		missingDBs      bool
+	}{
+		{name: "listener_disabled"},
+		{name: "bgp_not_in_enrichment", listenerEnabled: true},
+		{name: "startup_update_cached_offline", startupUpdate: true},
+		{name: "startup_update_missing_fails", startupUpdate: true, missingDBs: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			work := t.TempDir()
 			geoDir := filepath.Join(work, "geoip")
 			if err := os.Mkdir(geoDir, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			for _, name := range []string{"GeoLite2-ASN.mmdb", "GeoLite2-City.mmdb"} {
+				if tc.missingDBs {
+					continue
+				}
 				data, err := os.ReadFile(filepath.Join("..", "..", "internal", "enrich", "testdata", name))
 				if err != nil {
 					t.Fatal(err)
@@ -60,7 +73,7 @@ api:
   listen_address: 127.0.0.1
   port: %d
   mcp_enabled: false
-`, geoDir, enabled, port)
+`, geoDir, tc.listenerEnabled, port)
 			if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -72,7 +85,9 @@ api:
 			defer cancel()
 			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestMainProcess$")
 			cmd.Dir = work
-			cmd.Env = append(os.Environ(), "ARGUS_TEST_MAIN_CONFIG="+cfgPath)
+			cmd.Env = append(os.Environ(), "ARGUS_TEST_MAIN_CONFIG="+cfgPath,
+				"MAXMIND_UPDATE_ON_START="+strconv.FormatBool(tc.startupUpdate),
+				"MAXMIND_ACCOUNT_ID=", "MAXMIND_LICENSE_KEY=")
 			var output bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &output, &output
 			if err := cmd.Start(); err != nil {
@@ -96,6 +111,9 @@ api:
 				select {
 				case err := <-done:
 					waited = true
+					if tc.missingDBs && err != nil && bytes.Contains(output.Bytes(), []byte("startup database sync failed")) {
+						return // missing credentials and no usable cache must fail before readiness
+					}
 					t.Fatalf("entrypoint exited before API became ready: %v\n%s", err, output.String())
 				case <-ctx.Done():
 					cancel()
@@ -120,6 +138,9 @@ api:
 					waited = true
 					if err != nil {
 						t.Fatalf("entrypoint did not shut down cleanly: %v\n%s", err, output.String())
+					}
+					if tc.startupUpdate && !bytes.Contains(output.Bytes(), []byte("[maxmind] startup update check")) {
+						t.Fatal("startup updater was not invoked before the API became ready")
 					}
 					return
 				}

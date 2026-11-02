@@ -64,8 +64,21 @@ func New(cfg Config) *Updater {
 	}
 	return &Updater{
 		cfg:   cfg,
-		httpc: &http.Client{Timeout: cfg.HTTPTimeout},
+		httpc: newHTTPClient(cfg.HTTPTimeout),
 	}
+}
+
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		initial := via[0].URL
+		if req.URL.Scheme != initial.Scheme || !strings.EqualFold(req.URL.Host, initial.Host) {
+			req.Header.Del("Authorization")
+		}
+		return nil
+	}}
 }
 
 func defaultPermalinks() map[string]string {
@@ -111,7 +124,7 @@ func EnsureDBs(cfg Config) error {
 
 	u := &Updater{
 		cfg:   cfg,
-		httpc: &http.Client{Timeout: cfg.HTTPTimeout},
+		httpc: newHTTPClient(cfg.HTTPTimeout),
 	}
 
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
@@ -200,50 +213,39 @@ func (u *Updater) checkOnce(ctx context.Context, logf func(string, ...any)) {
 func (u *Updater) head(ctx context.Context, url string) (time.Time, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
-		return time.Time{}, "", err
+		return time.Time{}, "", fmt.Errorf("invalid HEAD request URL")
 	}
 	req.SetBasicAuth(u.cfg.AccountID, u.cfg.LicenseKey)
 	resp, err := u.httpc.Do(req)
 	if err != nil {
-		return time.Time{}, "", err
+		return time.Time{}, "", fmt.Errorf("HEAD request failed (network, redirect, timeout, or cancellation)")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return time.Time{}, "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 
-	var remoteDate time.Time
-	if lm := resp.Header.Get("Last-Modified"); lm != "" {
-		if t, err := http.ParseTime(lm); err == nil {
-			remoteDate = t
-		}
-	}
-	if remoteDate.IsZero() {
-		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-			if m := dispDate.FindStringSubmatch(cd); len(m) == 2 {
-				if t, err := time.Parse("20060102", m[1]); err == nil {
-					remoteDate = t
-				}
-			}
-		}
-	}
-
-	return remoteDate, resp.Header.Get("ETag"), nil
+	metadata := responseMetadata(resp.Header)
+	return metadata.Modified, metadata.ETag, nil
 }
 
 func (u *Updater) downloadAndInstall(ctx context.Context, url, edition string) error {
+	return u.downloadAndInstallMetadata(ctx, url, edition, nil)
+}
+
+func (u *Updater) downloadAndInstallMetadata(ctx context.Context, url, edition string, metadata *startupEdition) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid GET request URL")
 	}
 	req.SetBasicAuth(u.cfg.AccountID, u.cfg.LicenseKey)
 
 	resp, err := u.httpc.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("GET request failed (network, redirect, timeout, or cancellation)")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
@@ -255,46 +257,56 @@ func (u *Updater) downloadAndInstall(ctx context.Context, url, edition string) e
 
 	tr := tar.NewReader(gr)
 	outBase := edition + ".mmdb"
-	outPath := filepath.Join(u.cfg.Dir, outBase)
-
+	tmpPath := ""
+	defer func() {
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid database archive")
 		}
-		if hdr.FileInfo().IsDir() || !strings.HasSuffix(hdr.Name, ".mmdb") {
+		if !hdr.FileInfo().Mode().IsRegular() || !strings.HasSuffix(hdr.Name, ".mmdb") {
 			continue
 		}
-
+		if tmpPath != "" {
+			return fmt.Errorf("multiple MMDB files in archive")
+		}
 		tmp, err := os.CreateTemp(u.cfg.Dir, outBase+".tmp-*")
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot stage database")
 		}
-		tmpPath := tmp.Name()
-
-		if _, err := io.Copy(tmp, tr); err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-			return err
+		tmpPath = tmp.Name()
+		_, copyErr := io.Copy(tmp, tr)
+		chmodErr := tmp.Chmod(0644)
+		closeErr := tmp.Close()
+		if copyErr != nil || chmodErr != nil || closeErr != nil {
+			return fmt.Errorf("cannot write complete staged database")
 		}
-		_ = tmp.Chmod(0o644)
-		if err := tmp.Close(); err != nil {
-			_ = os.Remove(tmpPath)
-			return err
-		}
-		if err := os.Rename(tmpPath, outPath); err != nil {
-			if rerr := os.Remove(tmpPath); rerr != nil {
-				return errors.Join(err, rerr)
-			}
-			return err
-		}
-		return nil // first .mmdb only
 	}
-
-	return fmt.Errorf("no .mmdb found in archive for %s", edition)
+	// tar EOF can occur before gzip's footer. Read to the physical end so a
+	// truncated stream or failed CRC never replaces a last-known-good database.
+	if _, err := io.Copy(io.Discard, gr); err != nil {
+		return fmt.Errorf("invalid gzip checksum or truncated archive")
+	}
+	if tmpPath == "" {
+		return fmt.Errorf("no MMDB found in database archive")
+	}
+	if _, err := databaseRelease(tmpPath, edition); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, filepath.Join(u.cfg.Dir, outBase)); err != nil {
+		return fmt.Errorf("cannot install staged database")
+	}
+	if metadata != nil {
+		*metadata = responseMetadata(resp.Header)
+	}
+	return nil
 }
 
 func (u *Updater) statePath() string { return filepath.Join(u.cfg.Dir, ".state.json") }

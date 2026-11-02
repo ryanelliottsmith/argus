@@ -42,7 +42,11 @@ upstream_interfaces:
 #  "192.0.2.12": [7]      # R2: second upstream
 
 maxmind:
-  enabled: true
+  # Recommended container mode: enabled=false, update_on_start=true. Runtime
+  # MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY override the YAML credentials.
+  # MAXMIND_UPDATE_ON_START=true/false overrides update_on_start.
+  enabled: true # legacy background updater; readers need restart after updates
+  update_on_start: false
   account_id: "0000000"
   license_key: "YOUR_LICENSE_KEY_HERE"
   db_path: "/opt/argus/data/geoip"
