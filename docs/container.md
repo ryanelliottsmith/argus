@@ -74,8 +74,11 @@ leave both `maxmind.enabled` and `maxmind.update_on_start` false (and do not set
 `MAXMIND_UPDATE_ON_START=true`). An external updater can replace them; restart
 Argus afterwards to reopen readers. The opt-in startup updater below is an
 alternative that checks/downloads before readers open. Removing `ptr` from
-`enrich` is not a universal DNS-disable switch; ASN profile pages also have the
-external lookup described in the code review.
+`enrich` is not a universal DNS-disable switch; ASN profile pages also perform
+optional RIPEstat lookups against `stat.ripe.net` over TCP 443. Replace obsolete
+`api.bgpview.io` policy allowances when deploying this adapter; retain the DNS
+and MaxMind rules your configuration requires. See [ASN enrichment](asn-enrichment.md)
+for the provider's coverage limits and a Cilium egress-rule fragment.
 The current dashboard still uses browser-loaded CDN scripts; a shell-free image
 and pod policy do not make the UI fully offline or contain browser requests.
 

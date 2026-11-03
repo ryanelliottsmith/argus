@@ -90,6 +90,13 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   trims the table FIFO by id, mirroring `blackhole_events_max_rows`.
 
 ### Changed
+- **ASN profile enrichment now uses RIPEstat (`stat.ripe.net`) instead of the
+  unavailable BGPView API.** Organisation names, snapshot-observed prefixes and
+  RIS-observed AS neighbours retain the existing profile JSON shape with
+  `ripestat` attribution. Country and IX presence remain explicitly unavailable;
+  uncertain collector-only neighbours are excluded. Counts are calculated before
+  display-list truncation. See `docs/asn-enrichment.md` for semantics, verification
+  and the DNS/TCP 443 egress change; local flow collection and MaxMind are unchanged.
 - **Detection alerts are now incidents, not one block per second.** Rules
   re-evaluate every second over a sliding window, so a single scanner wrote the
   same alert block for as long as it stayed in the window. That added up to

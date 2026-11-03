@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,13 +17,16 @@ import (
 )
 
 const (
-	defaultBaseURL       = "https://api.bgpview.io"
+	defaultBaseURL       = "https://stat.ripe.net"
 	defaultFreshTTL      = 15 * time.Minute
 	defaultStaleTTL      = 2 * time.Hour
 	defaultReqTimeout    = 3 * time.Second
 	defaultRetryBudget   = 2 // extra attempts after first try
 	defaultMaxListValues = 30
 	defaultOpenFor       = 45 * time.Second
+	// Large ASNs can return several MB of prefix timelines. Bound network input,
+	// independently of the small display-list cap.
+	maxResponseBytes = 16 << 20
 )
 
 type OptionalField[T any] struct {
@@ -128,10 +134,19 @@ func (c *Client) GetProfile(ctx context.Context, asn uint32, observed [][]uint32
 		return p, cacheState, status, nil
 	}
 
-	profile := Profile{ASN: asn, Source: "bgpview", FetchedAt: now}
-	sourceStatus := make(map[string]ProviderStatus, 5)
+	return c.fetchProfile(ctx, asn, observed)
+}
 
-	baseData, baseStatus, err := c.fetchProviderJSON(ctx, "bgpview:base", fmt.Sprintf("%s/asn/%d", c.baseURL, asn))
+// fetchProfile deliberately bypasses cache reads so stale refresh does real I/O.
+func (c *Client) fetchProfile(ctx context.Context, asn uint32, observed [][]uint32) (Profile, CacheState, map[string]ProviderStatus, error) {
+	profile := Profile{ASN: asn, Source: "ripestat", FetchedAt: time.Now().UTC()}
+	sourceStatus := map[string]ProviderStatus{
+		"base":     {Provider: "ripestat:base", Error: "not_attempted"},
+		"prefixes": {Provider: "ripestat:prefixes", Error: "not_attempted"},
+		"peers":    {Provider: "ripestat:peers", Error: "not_attempted"},
+	}
+
+	baseData, baseStatus, err := c.fetchProviderJSON(ctx, "ripestat:base", fmt.Sprintf("%s/data/as-overview/data.json?resource=AS%d", c.baseURL, asn))
 	sourceStatus["base"] = baseStatus
 	if err != nil {
 		if meta := buildObservedPaths(observed); meta.PathCount > 0 {
@@ -141,23 +156,19 @@ func (c *Client) GetProfile(ctx context.Context, asn uint32, observed [][]uint32
 	}
 	fillBaseFields(&profile, baseData)
 
-	if prefixesData, status, err := c.fetchProviderJSON(ctx, "bgpview:prefixes", fmt.Sprintf("%s/asn/%d/prefixes", c.baseURL, asn)); err == nil {
+	snapshot, _ := stringValue(mapValue(baseData, "data"), "query_endtime")
+	prefixURL := fmt.Sprintf("%s/data/announced-prefixes/data.json?resource=AS%d&starttime=%s&endtime=%s", c.baseURL, asn, url.QueryEscape(snapshot), url.QueryEscape(snapshot))
+	if prefixesData, status, err := c.fetchProviderJSON(ctx, "ripestat:prefixes", prefixURL); err == nil {
 		fillPrefixes(&profile, prefixesData)
 		sourceStatus["prefixes"] = status
 	} else {
 		sourceStatus["prefixes"] = status
 	}
-	if peersData, status, err := c.fetchProviderJSON(ctx, "bgpview:peers", fmt.Sprintf("%s/asn/%d/peers", c.baseURL, asn)); err == nil {
+	if peersData, status, err := c.fetchProviderJSON(ctx, "ripestat:peers", fmt.Sprintf("%s/data/asn-neighbours/data.json?resource=AS%d", c.baseURL, asn)); err == nil {
 		fillPeers(&profile, peersData)
 		sourceStatus["peers"] = status
 	} else {
 		sourceStatus["peers"] = status
-	}
-	if ixsData, status, err := c.fetchProviderJSON(ctx, "bgpview:ixs", fmt.Sprintf("%s/asn/%d/ixs", c.baseURL, asn)); err == nil {
-		fillIXPresence(&profile, ixsData)
-		sourceStatus["ixs"] = status
-	} else {
-		sourceStatus["ixs"] = status
 	}
 
 	if meta := buildObservedPaths(observed); meta.PathCount > 0 {
@@ -197,7 +208,7 @@ func (c *Client) refreshAsync(asn uint32, observed [][]uint32) {
 		}()
 		refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if _, _, _, err := c.GetProfile(refreshCtx, asn, observed); err != nil {
+		if _, _, _, err := c.fetchProfile(refreshCtx, asn, observed); err != nil {
 			log.Printf(`{"component":"asnintel","event":"async_refresh","asn":%d,"ok":false,"error":%q}`, asn, err.Error())
 		}
 	}()
@@ -228,6 +239,22 @@ func (c *Client) fetchProviderJSON(ctx context.Context, provider string, url str
 	}
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
+		if attempt > 0 {
+			timer := time.NewTimer(time.Duration(attempt) * 120 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				lastErr = ctx.Err()
+			case <-timer.C:
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
 		reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 		if err != nil {
@@ -238,24 +265,36 @@ func (c *Client) fetchProviderJSON(ctx context.Context, provider string, url str
 			return nil, status, err
 		}
 		resp, err := c.httpClient.Do(req)
-		cancel()
 		if err != nil {
 			lastErr = err
 			if reqCtx.Err() == context.DeadlineExceeded {
 				status.Timeout = true
 			}
-			time.Sleep(time.Duration(attempt+1) * 120 * time.Millisecond)
+			cancel()
 			continue
 		}
 		var payload map[string]interface{}
-		dec := json.NewDecoder(resp.Body)
-		if err := dec.Decode(&payload); err != nil {
-			_ = resp.Body.Close()
-			lastErr = err
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+		_ = resp.Body.Close()
+		if readErr == nil && len(body) > maxResponseBytes {
+			readErr = fmt.Errorf("RIPEstat response exceeds %d bytes", maxResponseBytes)
+		}
+		if readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			readErr = json.Unmarshal(body, &payload)
+		}
+		if reqCtx.Err() == context.DeadlineExceeded {
+			status.Timeout = true
+		}
+		cancel()
+		if readErr != nil {
+			lastErr = readErr
 			continue
 		}
-		_ = resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := validatePayload(provider, req.URL, payload); err != nil {
+				lastErr = err
+				break
+			}
 			status.OK = true
 			status.LatencyMS = time.Since(start).Milliseconds()
 			c.markProviderSuccess(provider)
@@ -266,12 +305,14 @@ func (c *Client) fetchProviderJSON(ctx context.Context, provider string, url str
 		if resp.StatusCode < 500 {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 120 * time.Millisecond)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("unknown fetch error")
 	}
 	status.Error = lastErr.Error()
+	if ctx.Err() == context.DeadlineExceeded {
+		status.Timeout = true
+	}
 	status.LatencyMS = time.Since(start).Milliseconds()
 	c.markProviderFailure(provider, time.Now())
 	c.logProviderMetric(provider, status, attempts)
@@ -318,79 +359,157 @@ func (c *Client) logProviderMetric(provider string, status ProviderStatus, attem
 	)
 }
 
+func validatePayload(provider string, requestURL *url.URL, payload map[string]interface{}) error {
+	status, _ := stringValue(payload, "status")
+	code, ok := intValue(payload, "status_code")
+	data, object := payload["data"].(map[string]interface{})
+	if status != "ok" || !ok || code != http.StatusOK || !object || data == nil {
+		return fmt.Errorf("invalid RIPEstat envelope")
+	}
+	resource, ok := stringValue(data, "resource")
+	if !ok || strings.TrimPrefix(resource, "AS") != strings.TrimPrefix(requestURL.Query().Get("resource"), "AS") {
+		return fmt.Errorf("RIPEstat resource mismatch")
+	}
+	if provider == "ripestat:base" {
+		if _, ok := stringValue(data, "holder"); !ok {
+			return fmt.Errorf("invalid RIPEstat holder")
+		}
+		if _, err := dataTime(data, "query_endtime"); err != nil {
+			return err
+		}
+	}
+	if provider == "ripestat:prefixes" {
+		snapshot, err := dataTime(data, "query_endtime")
+		if err != nil {
+			return err
+		}
+		requested, err := dataTime(map[string]interface{}{"time": requestURL.Query().Get("endtime")}, "time")
+		if err != nil || !snapshot.Equal(requested) {
+			return fmt.Errorf("RIPEstat prefix snapshot mismatch")
+		}
+		items, ok := data["prefixes"].([]interface{})
+		if !ok {
+			return fmt.Errorf("invalid RIPEstat prefixes")
+		}
+		for _, raw := range items {
+			item, ok := raw.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("invalid RIPEstat prefix row")
+			}
+			prefix, ok := stringValue(item, "prefix")
+			if _, err := netip.ParsePrefix(prefix); !ok || err != nil {
+				return fmt.Errorf("invalid RIPEstat prefix")
+			}
+			timelines, ok := item["timelines"].([]interface{})
+			if !ok || len(timelines) == 0 {
+				return fmt.Errorf("invalid RIPEstat timelines")
+			}
+			for _, raw := range timelines {
+				timeline, _ := raw.(map[string]interface{})
+				start, err := dataTime(timeline, "starttime")
+				if err != nil {
+					return err
+				}
+				end, err := dataTime(timeline, "endtime")
+				if err != nil {
+					return err
+				}
+				if start.After(end) {
+					return fmt.Errorf("invalid RIPEstat timeline range")
+				}
+			}
+		}
+	}
+	if provider == "ripestat:peers" {
+		items, ok := data["neighbours"].([]interface{})
+		if !ok {
+			return fmt.Errorf("invalid RIPEstat neighbours")
+		}
+		for _, raw := range items {
+			item, ok := raw.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("invalid RIPEstat neighbour row")
+			}
+			asn, ok := intValue(item, "asn")
+			kind, _ := stringValue(item, "type")
+			if !ok || asn <= 0 || uint64(asn) > uint64(^uint32(0)) || (kind != "left" && kind != "right" && kind != "uncertain") {
+				return fmt.Errorf("invalid RIPEstat neighbour")
+			}
+		}
+	}
+	return nil
+}
+
+func dataTime(data map[string]interface{}, key string) (time.Time, error) {
+	value, ok := stringValue(data, key)
+	if ok {
+		for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05"} {
+			if parsed, err := time.Parse(layout, value); err == nil {
+				return parsed, nil
+			}
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid RIPEstat %s", key)
+}
+
 func fillBaseFields(out *Profile, payload map[string]interface{}) {
 	data := mapValue(payload, "data")
-	if name, ok := stringValue(data, "name"); ok && name != "" {
-		out.Name = OptionalField[string]{Present: true, Source: "bgpview", Value: name}
-	}
-	if cc, ok := stringValue(data, "country_code"); ok && cc != "" {
-		out.Country = OptionalField[string]{Present: true, Source: "bgpview", Value: strings.ToUpper(cc)}
-	}
-	if n, ok := intValue(data, "num_prefixes"); ok {
-		out.AnnouncedPrefixesCount = OptionalField[int]{Present: true, Source: "bgpview", Value: n}
-	}
-	if n, ok := intValue(data, "num_peers"); ok {
-		out.PeersCount = OptionalField[int]{Present: true, Source: "bgpview", Value: n}
+	if name, ok := stringValue(data, "holder"); ok && name != "" {
+		out.Name = OptionalField[string]{Present: true, Source: "ripestat", Value: name}
 	}
 }
 
 func fillPrefixes(out *Profile, payload map[string]interface{}) {
 	data := mapValue(payload, "data")
-	all := make([]string, 0, defaultMaxListValues)
-	all = append(all, extractPrefixes(data, "ipv4_prefixes")...)
-	all = append(all, extractPrefixes(data, "ipv6_prefixes")...)
-	all = uniqStrings(all)
-	if len(all) > 0 {
-		if len(all) > defaultMaxListValues {
-			all = all[:defaultMaxListValues]
+	items, _ := data["prefixes"].([]interface{})
+	snapshot, _ := dataTime(data, "query_endtime")
+	all := make([]string, 0, len(items))
+	for _, raw := range items {
+		item, _ := raw.(map[string]interface{})
+		prefix, ok := stringValue(item, "prefix")
+		p, err := netip.ParsePrefix(prefix)
+		if !ok || err != nil {
+			continue
 		}
-		out.AnnouncedPrefixes = OptionalField[[]string]{Present: true, Source: "bgpview", Value: all}
-		if !out.AnnouncedPrefixesCount.Present {
-			out.AnnouncedPrefixesCount = OptionalField[int]{Present: true, Source: "bgpview", Value: len(all)}
+		timelines, _ := item["timelines"].([]interface{})
+		for _, raw := range timelines {
+			timeline, _ := raw.(map[string]interface{})
+			start, _ := dataTime(timeline, "starttime")
+			end, _ := dataTime(timeline, "endtime")
+			if !snapshot.Before(start) && !snapshot.After(end) {
+				all = append(all, p.Masked().String())
+				break
+			}
 		}
 	}
+	all = uniqStrings(all)
+	out.AnnouncedPrefixesCount = OptionalField[int]{Present: true, Source: "ripestat", Value: len(all)}
+	if len(all) > defaultMaxListValues {
+		all = all[:defaultMaxListValues]
+	}
+	out.AnnouncedPrefixes = OptionalField[[]string]{Present: true, Source: "ripestat", Value: all}
 }
 
 func fillPeers(out *Profile, payload map[string]interface{}) {
 	data := mapValue(payload, "data")
-	peers := make([]uint32, 0, defaultMaxListValues)
-	peers = append(peers, extractPeerASNs(data, "ipv4_peers")...)
-	peers = append(peers, extractPeerASNs(data, "ipv6_peers")...)
-	peers = uniqUint32s(peers)
-	if len(peers) > 0 {
-		if len(peers) > defaultMaxListValues {
-			peers = peers[:defaultMaxListValues]
-		}
-		out.Peers = OptionalField[[]uint32]{Present: true, Source: "bgpview", Value: peers}
-		if !out.PeersCount.Present {
-			out.PeersCount = OptionalField[int]{Present: true, Source: "bgpview", Value: len(peers)}
-		}
-	}
-}
-
-func fillIXPresence(out *Profile, payload map[string]interface{}) {
-	data := mapValue(payload, "data")
-	items, ok := data["ixs"].([]interface{})
-	if !ok {
-		return
-	}
-	names := make([]string, 0, len(items))
+	items, _ := data["neighbours"].([]interface{})
+	peers := make([]uint32, 0, len(items))
+	// Left/right are RIS-observed adjacencies, not contractual peer inventory.
+	// Uncertain entries are collector-peering artifacts, not observed adjacencies.
 	for _, raw := range items {
-		item, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
+		item, _ := raw.(map[string]interface{})
+		kind, _ := stringValue(item, "type")
+		asn, ok := intValue(item, "asn")
+		if ok && asn > 0 && uint64(asn) <= uint64(^uint32(0)) && (kind == "left" || kind == "right") {
+			peers = append(peers, uint32(asn))
 		}
-		if name, ok := stringValue(item, "name"); ok && name != "" {
-			names = append(names, name)
-		}
 	}
-	names = uniqStrings(names)
-	if len(names) > defaultMaxListValues {
-		names = names[:defaultMaxListValues]
+	peers = uniqUint32s(peers)
+	out.PeersCount = OptionalField[int]{Present: true, Source: "ripestat", Value: len(peers)}
+	if len(peers) > defaultMaxListValues {
+		peers = peers[:defaultMaxListValues]
 	}
-	if len(names) > 0 {
-		out.IXPresence = OptionalField[[]string]{Present: true, Source: "bgpview", Value: names}
-	}
+	out.Peers = OptionalField[[]uint32]{Present: true, Source: "ripestat", Value: peers}
 }
 
 func buildObservedPaths(paths [][]uint32) ObservedPathsMetadata {
@@ -419,44 +538,6 @@ func buildObservedPaths(paths [][]uint32) ObservedPathsMetadata {
 		meta.MinHops = 0
 	}
 	return meta
-}
-
-func extractPrefixes(data map[string]interface{}, key string) []string {
-	items, ok := data[key].([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(items))
-	for _, raw := range items {
-		item, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if pfx, ok := stringValue(item, "prefix"); ok && pfx != "" {
-			out = append(out, pfx)
-		}
-	}
-	return out
-}
-
-func extractPeerASNs(data map[string]interface{}, key string) []uint32 {
-	items, ok := data[key].([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]uint32, 0, len(items))
-	for _, raw := range items {
-		item, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		asn, ok := intValue(item, "asn")
-		if !ok || asn <= 0 {
-			continue
-		}
-		out = append(out, uint32(asn))
-	}
-	return out
 }
 
 func mapValue(m map[string]interface{}, key string) map[string]interface{} {
@@ -490,6 +571,9 @@ func intValue(m map[string]interface{}, key string) (int, bool) {
 	}
 	switch t := v.(type) {
 	case float64:
+		if t < 0 || t > float64(^uint32(0)) || float64(uint32(t)) != t {
+			return 0, false
+		}
 		return int(t), true
 	case int:
 		return t, true
