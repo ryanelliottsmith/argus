@@ -239,6 +239,7 @@ type Netflow struct {
 	debug               bool
 	FlowChannel         chan map[uint16]fields.Value
 	logger              *log.Logger // New logger field
+	warningLogger       *log.Logger // Rate-limited diagnostics, independent of per-flow debug output.
 	logFile             *os.File    // To hold the file handle if logging to file
 	ReportedVersionOnce sync.Once
 	ReportedVersion     uint16
@@ -268,16 +269,19 @@ type netflowPacketFlowset struct {
 
 // TEMPLATE STRUCTS (remain the same)
 type netflowPacketTemplate struct {
+	Version     uint16
+	Options     bool // Tombstone: recognize the ID without decoding options as flow data.
 	FlowSetID   uint16
 	Length      uint16
 	ID          uint16
 	FieldCount  uint16
 	Fields      []templateField
-	FieldLength uint16
+	FieldLength int // Minimum encoded record size, including one-byte variable-length prefixes.
 }
 type templateField struct {
-	FieldType uint16
-	Length    uint16
+	FieldType  uint16
+	Length     uint16
+	Enterprise bool // IPFIX enterprise bit, including PEN zero: never use IANA decoders.
 }
 
 // DATA STRUCTS (remain the same)
@@ -368,58 +372,87 @@ Requires
 	logger *log.Logger : Logger instance for warnings
 */
 func parseData(n netflowPacket, p []byte, logger *log.Logger) netflowDataFlowset {
-	nfd := netflowDataFlowset{
-		FlowSetID: binary.BigEndian.Uint16(p[:2]),
-		Length:    binary.BigEndian.Uint16(p[2:4]),
+	var d netflowDataFlowset
+	if len(p) < 4 {
+		return d
 	}
-
-	// If we have no template for this source IP
-	if _, ok := n.Templates[n.Source]; !ok {
-		logger.Printf("Warning: No templates for source IP %d. Skipping data flowset.\n", n.Source)
-		return nfd
-	} else {
-		// If we have no templates for this source "ID"
-		if _, ok := n.Templates[n.Source][n.Header.Id]; !ok {
-			logger.Printf("Warning: No templates for source ID %d from IP %d. Skipping data flowset.\n", n.Header.Id, n.Source)
-			return nfd
-		} else {
-			// Finally, if we have no template ID matching the flowset.
-			if _, ok := n.Templates[n.Source][n.Header.Id][nfd.FlowSetID]; !ok {
-				logger.Printf("Warning: No template ID %d for source ID %d from IP %d. Skipping data flowset.\n", nfd.FlowSetID, n.Header.Id, n.Source)
-				return nfd
-			}
+	d.FlowSetID = binary.BigEndian.Uint16(p)
+	d.Length = binary.BigEndian.Uint16(p[2:])
+	if int(d.Length) != len(p) {
+		return d
+	}
+	t, ok := n.Templates[n.Source][n.Header.Id][d.FlowSetID]
+	if !ok || t.Version != n.Header.Version || t.Options || t.FieldLength <= 0 || len(t.Fields) == 0 {
+		if logger != nil {
+			logger.Print("Skipping data set without an ordinary flow template")
 		}
+		return d
 	}
-
-	t := n.Templates[n.Source][n.Header.Id][nfd.FlowSetID]
-
-	start := uint16(4)
-	// Read each Field in order from the flowset until the length is exceeded
-	for start < nfd.Length {
-		// Check the number of fields don't overrun the size of this flowset
-		// if so, remainder must be padding
-		if t.FieldLength <= (nfd.Length - start) {
-			fr := flowRecord{ValuesMap: make(map[uint16]fields.Value)}
-			for _, f := range t.Fields {
-				valueSlice := p[start : start+f.Length]
-				if function, ok := FUNCTIONMAP[f.FieldType]; ok {
-					value := function(valueSlice)
-					value.SetType(f.FieldType)
-					fr.Values = append(fr.Values, value)
-					fr.ValuesMap[f.FieldType] = value
-				} else {
-					// Log a warning for unknown field types
-					logger.Printf("Warning: Unknown Netflow field type %d encountered. Skipping.\n", f.FieldType)
+	p = p[4:]
+	malformed := func() netflowDataFlowset {
+		if logger != nil {
+			logger.Print("Dropping truncated or invalid data record")
+		}
+		return d
+	}
+	for len(p) >= t.FieldLength {
+		fr := flowRecord{ValuesMap: make(map[uint16]fields.Value)}
+		pos := 0
+		for _, f := range t.Fields {
+			width := int(f.Length)
+			if width == 65535 {
+				if len(p)-pos < 1 {
+					return malformed()
 				}
-				start = start + f.Length
+				width = int(p[pos])
+				pos++
+				if width == 255 {
+					if len(p)-pos < 2 {
+						return malformed()
+					}
+					width = int(binary.BigEndian.Uint16(p[pos:]))
+					pos += 2
+				}
 			}
-			nfd.Records = append(nfd.Records, fr)
-		} else {
-			// This handles padding at the end of the flowset
-			start = start + (nfd.Length - start) // Advance 'start' to the end of the flowset
+			if width > len(p)-pos {
+				return malformed()
+			}
+			// IPFIX IE 256 is IANA ethernetType, not Argus's internal timestamp alias (legacy v9 only).
+			if function, known := FUNCTIONMAP[f.FieldType]; known && !f.Enterprise && !(n.Header.Version == 10 && f.FieldType == fields.CUSTOM_TIMESTAMP) {
+				if !validFieldWidth(f.FieldType, width) && !(width == 0 && variableField(f.FieldType)) {
+					return malformed()
+				}
+				// Values escape to the asynchronous consumer; never retain the reusable UDP buffer.
+				valueBytes := append([]byte(nil), p[pos:pos+width]...)
+				var value fields.Value
+				if integerField(f.FieldType) {
+					var data uint64
+					for _, b := range valueBytes {
+						data = data<<8 | uint64(b)
+					}
+					value = fields.IntValue{Data: int(data), Bytes: valueBytes}
+				} else {
+					value = function(valueBytes)
+				}
+				value.SetType(f.FieldType)
+				fr.Values = append(fr.Values, value)
+				fr.ValuesMap[f.FieldType] = value
+			}
+			pos += width
+		}
+		if pos == 0 {
+			return malformed()
+		}
+		d.Records = append(d.Records, fr)
+		p = p[pos:]
+	}
+	// Padding is shorter than the minimum record and consists of zero octets.
+	for _, b := range p {
+		if b != 0 {
+			return malformed()
 		}
 	}
-	return nfd
+	return d
 }
 
 /*
@@ -435,36 +468,14 @@ Returns
 	netFlowPacketTemplate: Struct of template
 */
 func parseTemplate(templateSlice []byte) netflowPacketTemplate {
-	template := netflowPacketTemplate{
-		Fields: make([]templateField, 0),
+	if len(templateSlice) < 4 {
+		return netflowPacketTemplate{}
 	}
-	template.ID = binary.BigEndian.Uint16(templateSlice[4:6])
-
-	// Get the number of Fields
-	template.FieldCount = binary.BigEndian.Uint16(templateSlice[6:8])
-	// Start at the first fields and work through
-	fieldStart := 8
-	var read = uint16(0)
-	for read < template.FieldCount {
-		fieldTypeEnd := fieldStart + 2
-		fieldType := binary.BigEndian.Uint16(templateSlice[fieldStart:fieldTypeEnd])
-		fieldLengthEnd := fieldTypeEnd + 2
-		fieldLength := binary.BigEndian.Uint16(templateSlice[fieldTypeEnd:fieldLengthEnd])
-
-		// Create template FIELD struct
-		field := templateField{
-			FieldType: fieldType,
-			Length:    fieldLength,
-		}
-		// Template fields are IN ORDER
-		// Order determines records in data flowset
-		template.Fields = append(template.Fields, field)
-
-		read++
-		fieldStart = fieldLengthEnd
-		template.FieldLength = template.FieldLength + fieldLength
+	t, _, err := readTemplate(templateSlice[4:], 9)
+	if err != nil {
+		return netflowPacketTemplate{}
 	}
-	return template
+	return t
 }
 
 /*
@@ -475,55 +486,43 @@ Requires
 
 	nfp netflowPacket : netflowpacket struct
 	p []byte        : Packet bytes
-	start uint16        : Byte index to start at (skip the headers, etc)
+	start int           : Byte index to start at (skip the headers, etc)
 	logger *log.Logger : Logger instance for warnings
 */
-func Route(nfp netflowPacket, p []byte, start uint16, logger *log.Logger) netflowPacket {
-	id := uint16(0)
-	l := uint16(0)
-
-	for int(start) < nfp.Length {
-		// Check if there's enough bytes for ID and Length
-		if int(start+4) > nfp.Length {
-			logger.Printf("Warning: Malformed flowset header. Remaining packet length (%d) less than expected (4 bytes for ID+Length). Skipping remaining packet.\n", nfp.Length-int(start))
-			break // Break out of the loop if header cannot be read
+func Route(nfp netflowPacket, p []byte, start int, logger *log.Logger) netflowPacket {
+	end := len(p)
+	if nfp.Length < end {
+		end = nfp.Length
+	}
+	for start >= 0 && start < end {
+		if end-start < 4 {
+			if logger != nil {
+				logger.Print("Dropping truncated set header")
+			}
+			break
 		}
-
-		id = binary.BigEndian.Uint16(p[start : start+2])
-		l = binary.BigEndian.Uint16(p[start+2 : start+4])
-
-		// Check if the announced flowset length overruns the packet
-		if int(start+l) > nfp.Length {
-			logger.Printf("Warning: Flowset ID %d announced length %d, but only %d bytes remain in packet. Skipping this flowset.\n", id, l, nfp.Length-int(start))
-			break // Break or advance by remaining length, depending on desired robustness
+		id := binary.BigEndian.Uint16(p[start:])
+		length := int(binary.BigEndian.Uint16(p[start+2:]))
+		if length < 4 || length > end-start {
+			if logger != nil {
+				logger.Print("Dropping invalid set length")
+			}
+			break
 		}
-
-		// Slice the next flowset out
-		s := p[start : start+l]
-		// Flowset ID is the switch we use to determine what sort of flowset follows
+		s := p[start : start+length]
 		switch {
-		// Template flowset
-		case id == uint16(0):
-			t := parseTemplate(s)
-			// If we've not had a template from this box yet
-			if _, ok := nfp.Templates[nfp.Source]; !ok {
-				nfp.Templates[nfp.Source] = make(map[uint32]map[uint16]netflowPacketTemplate)
-			}
-
-			if _, ok := nfp.Templates[nfp.Source][nfp.Header.Id]; !ok {
-				nfp.Templates[nfp.Source][nfp.Header.Id] = make(map[uint16]netflowPacketTemplate)
-			}
-			nfp.Templates[nfp.Source][nfp.Header.Id][t.ID] = t
-
-		// Data flowset
-		case id > uint16(255):
-			d := parseData(nfp, s, logger) // Pass logger to parseData
-			nfp.Data = append(nfp.Data, d)
+		case (nfp.Header.Version == 10 && id == 2) || (nfp.Header.Version == 9 && id == 0):
+			parseTemplates(&nfp, s[4:], logger)
+		case (nfp.Header.Version == 10 && id == 3) || (nfp.Header.Version == 9 && id == 1):
+			skipOptionsTemplates(&nfp, s[4:], logger)
+		case id >= 256:
+			nfp.Data = append(nfp.Data, parseData(nfp, s, logger))
 		default:
-			// Handle unknown flowset IDs (e.g., options templates, other future types)
-			logger.Printf("Warning: Unknown Flowset ID %d encountered. Skipping flowset.\n", id)
+			if logger != nil {
+				logger.Printf("Skipping unsupported set ID %d (including options templates)", id)
+			}
 		}
-		start = start + l
+		start += length
 	}
 	return nfp
 }
@@ -559,17 +558,20 @@ func (n *Netflow) Configure(config map[string]string) {
 		n.logFile = file
 		logOutput = file
 	} else {
-		// No logging at all
-		logOutput = io.Discard
+		// Malformed input must remain visible even when per-flow debug is disabled.
+		logOutput = os.Stderr
 	}
 
-	n.logger = log.New(logOutput, "[DEBUG] ", log.Ldate|log.Ltime|log.Lshortfile)
+	n.logger = log.New(logOutput, "[NETFLOW] ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	// Init flow channel
 	n.FlowChannel = make(chan map[uint16]fields.Value, 1000)
 }
 
 func (nf *Netflow) Start() {
+	if nf.logger == nil {
+		nf.logger = log.Default()
+	}
 	if nf.logFile != nil {
 		defer func() {
 			if err := nf.logFile.Close(); err != nil {
@@ -597,98 +599,16 @@ func (nf *Netflow) Start() {
 
 	nf.Templates = make(map[uint32]map[uint32]map[uint16]netflowPacketTemplate)
 
+	defer conn.Close()
+	// Large enough for an ordinary full UDP datagram (IPv4 or IPv6).
+	packet := make([]byte, 65535)
 	for {
-		nfpacket := netflowPacket{Templates: nf.Templates}
-		packet := make([]byte, 1500)
-
 		n, remoteAddr, err := conn.ReadFromUDP(packet)
 		if err != nil {
-			nf.logger.Printf("Error reading from UDP: %v\n", err)
+			nf.warnings().Printf("Error reading from UDP: %v", err)
 			continue
 		}
-		nfpacket.Length = n
-
-		nfpacket.Source = exporterKey(remoteAddr.IP)
-		exporter := remoteAddr.IP.String()
-
-		p := netflowPacketHeader{}
-		p.Version = binary.BigEndian.Uint16(packet[:2])
-		p.Length = binary.BigEndian.Uint16(packet[2:4])
-
-		nf.ReportedVersionOnce.Do(func() {
-			nf.ReportedVersion = p.Version
-			switch p.Version {
-			case 9:
-				msg := "[NETFLOW] Detected NetFlow v9"
-				nf.logger.Println(msg) // γράφει σε log αρχείο
-				fmt.Println(msg)       // δείχνει στην κονσόλα
-			case 10:
-				msg := "[NETFLOW] Detected IPFIX (v10)"
-				nf.logger.Println(msg)
-				fmt.Println(msg)
-			default:
-				msg := fmt.Sprintf("[NETFLOW] Detected unknown NetFlow version: %d", p.Version)
-				nf.logger.Println(msg)
-				fmt.Println(msg)
-			}
-		})
-
-		if nfpacket.Length < 20 {
-			nf.logger.Printf("Packet too short. Skipping.\n")
-			continue
-		}
-
-		switch p.Version {
-		case 9:
-			p.Uptime = binary.BigEndian.Uint32(packet[4:8])
-			p.Usecs = binary.BigEndian.Uint32(packet[8:12])
-			p.Sequence = binary.BigEndian.Uint32(packet[12:16])
-			p.Id = binary.BigEndian.Uint32(packet[16:20])
-		case 10:
-			p.ExportTime = binary.BigEndian.Uint32(packet[4:8])
-			p.Sequence = binary.BigEndian.Uint32(packet[8:12])
-			p.ObservationDomainID = binary.BigEndian.Uint32(packet[12:16])
-			p.Id = p.ObservationDomainID // προαιρετικό, για κοινή χρήση
-		}
-		switch p.Version {
-		case 5:
-			nf.logger.Printf("NetFlow v5 unsupported. Exiting.\n")
-			os.Exit(1)
-		case 9, 10:
-			// supported
-		default:
-			nf.logger.Printf("Unsupported NetFlow version: %d\n", p.Version)
-			continue
-		}
-
-		nfpacket.Header = p
-		nfpacket = Route(nfpacket, packet, uint16(20), nf.logger)
-		nf.Templates = nfpacket.Templates
-
-		for _, dfs := range nfpacket.Data {
-			for _, record := range dfs.Records {
-				record.calcTime(p.Uptime, p.Usecs)
-				record.ValuesMap[fields.CUSTOM_EXPORTER_ADDR] = fields.StringValue{Data: exporter}
-
-				// Always push to channel if it's defined
-				if nf.FlowChannel != nil {
-					select {
-					case nf.FlowChannel <- record.ValuesMap:
-					default:
-						nf.logger.Printf("Warning: FlowChannel full. Dropping flow.\n")
-					}
-				}
-
-				// Also print if debug is enabled
-				if nf.debug {
-					var sl []string
-					for t, val := range record.ValuesMap {
-						sl = append(sl, fmt.Sprintf("(%v)%v", t, val.ToString()))
-					}
-					nf.logger.Printf("[FLOW] %s", strings.Join(sl, " : "))
-				}
-			}
-		}
+		nf.HandleUDPFlow(remoteAddr, packet[:n])
 	}
 }
 
@@ -713,6 +633,9 @@ func NewNetflowCollector(addr string, port int, debug bool, flowChannel chan map
 		return nil, fmt.Errorf("invalid bind address: %s", addr)
 	}
 
+	if writer == nil {
+		writer = os.Stderr
+	}
 	logger := log.New(writer, "GOFLOW: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	return &Netflow{
@@ -726,49 +649,70 @@ func NewNetflowCollector(addr string, port int, debug bool, flowChannel chan map
 }
 
 func (nf *Netflow) HandleUDPFlow(remoteAddr *net.UDPAddr, packet []byte) {
-	nfpacket := netflowPacket{}
-
-	// Ensure packet is long enough for the header
-	if len(packet) < 20 {
-		nf.logger.Printf("Packet too short for Netflow header. Length: %d. Skipping.\n", len(packet))
-		return // Exit early
+	warnings := nf.warnings()
+	if len(packet) < 2 {
+		warnings.Print("Dropping short datagram header")
+		return
 	}
-
-	// Parse Netflow Header
-	nfpacket.Header.Version = binary.BigEndian.Uint16(packet[0:2])
-	nfpacket.Header.Length = binary.BigEndian.Uint16(packet[2:4])
-	nfpacket.Header.Uptime = binary.BigEndian.Uint32(packet[4:8])
-	nfpacket.Header.Usecs = binary.BigEndian.Uint32(packet[8:12])
-	nfpacket.Header.Sequence = binary.BigEndian.Uint32(packet[12:16])
-	nfpacket.Header.Id = binary.BigEndian.Uint32(packet[16:20])
-
-	// Basic validation for Netflow header length
-	if int(nfpacket.Header.Length) > len(packet) {
-		nf.logger.Printf("Netflow packet header claims length %d, but actual packet size is %d. Skipping.\n", nfpacket.Header.Length, len(packet))
-		return // Exit early if header length is invalid
+	if nf.Templates == nil {
+		nf.Templates = make(map[uint32]map[uint32]map[uint16]netflowPacketTemplate)
 	}
-
-	switch nfpacket.Header.Version {
-	case 5:
-		nf.logger.Printf("Wrong Netflow version (%d), only v9+ supported. Exiting.\n", nfpacket.Header.Version)
-		os.Exit(1)
-	case 9, 10: // Explicitly handle v9
-		// Continue processing
+	nfpacket := netflowPacket{Source: exporterKey(remoteAddr.IP), Length: len(packet), Templates: nf.Templates}
+	p := &nfpacket.Header
+	p.Version = binary.BigEndian.Uint16(packet)
+	start := 20
+	switch p.Version {
+	case 9:
+		if len(packet) < 20 {
+			warnings.Print("Dropping short NetFlow v9 header")
+			return
+		}
+		p.Count = binary.BigEndian.Uint16(packet[2:4])
+		p.Uptime = binary.BigEndian.Uint32(packet[4:8])
+		p.Usecs = binary.BigEndian.Uint32(packet[8:12])
+		p.Sequence = binary.BigEndian.Uint32(packet[12:16])
+		p.Id = binary.BigEndian.Uint32(packet[16:20])
+	case 10:
+		if len(packet) < 16 {
+			warnings.Print("Dropping short IPFIX header")
+			return
+		}
+		p.Length = binary.BigEndian.Uint16(packet[2:4])
+		if int(p.Length) != len(packet) {
+			warnings.Print("Dropping IPFIX message length mismatch")
+			return
+		}
+		p.ExportTime = binary.BigEndian.Uint32(packet[4:8])
+		p.Sequence = binary.BigEndian.Uint32(packet[8:12])
+		p.Id = binary.BigEndian.Uint32(packet[12:16])
+		p.ObservationDomainID = p.Id
+		start = 16
 	default:
-		nf.logger.Printf("Unsupported Netflow version (%d). Skipping packet.\n", nfpacket.Header.Version)
-		return // Skip packet if version is not 9
+		warnings.Printf("Dropping unsupported NetFlow version %d", p.Version)
+		return
 	}
-
-	nfpacket = Route(nfpacket, packet, uint16(20), nf.logger) // Pass logger to Route
+	nf.ReportedVersionOnce.Do(func() {
+		nf.ReportedVersion = p.Version
+		if nf.logger != nil {
+			nf.logger.Printf("[NETFLOW] Detected version %d", p.Version)
+		}
+	})
+	nfpacket = Route(nfpacket, packet, start, warnings)
 	nf.Templates = nfpacket.Templates
 
 	for _, dfs := range nfpacket.Data {
 		for _, record := range dfs.Records {
-			// CORRECTED LINE: Use nfpacket.Header.Uptime and nfpacket.Header.Usecs
-			record.calcTime(nfpacket.Header.Uptime, nfpacket.Header.Usecs)
+			if nfpacket.Header.Version == 9 {
+				record.calcTime(nfpacket.Header.Uptime, nfpacket.Header.Usecs)
+			}
+			record.ValuesMap[fields.CUSTOM_EXPORTER_ADDR] = fields.StringValue{Data: remoteAddr.IP.String()}
 
 			if nf.FlowChannel != nil {
-				nf.FlowChannel <- record.ValuesMap
+				select {
+				case nf.FlowChannel <- record.ValuesMap:
+				default:
+					warnings.Print("Dropping flow: collector channel full")
+				}
 			}
 
 			if nf.debug {

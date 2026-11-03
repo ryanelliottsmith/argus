@@ -110,6 +110,13 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   is reclaimed with a one-time `VACUUM` (see README → Storage / disk).
 
 ### Fixed
+- **Collector template panic and IPFIX framing.** Validate packet/set/template
+  and data-record boundaries instead of trusting advertised counts and lengths;
+  distinguish NetFlow v9 from native IPFIX/v10 framing. Invalid datagrams must
+  not crash or wedge collection, and valid exports larger than 1500 bytes are
+  no longer truncated by the old receive allocation. Verified locally with a
+  real-entrypoint UDP-to-SQLite regression reproducing the original panic. See
+  `docs/collector-decoder.md` for the draft's scope and exporter test procedure.
 - **Historical flowstore bucket totals were overwritten at non-boundary ticks.**
   Keep open 5-minute timeline/interface and 30-minute detail buckets in memory
   until closed, selecting top-N from the whole observed detail bucket. Failed
