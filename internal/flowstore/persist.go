@@ -5,6 +5,8 @@ import (
 	"log"
 	"sort"
 	"time"
+
+	"argus/internal/sqlite"
 )
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -551,7 +553,7 @@ func (s *Store) pruneTables(retentionDays int, tables []string) {
 	}
 	cutoff := time.Now().Unix() - int64(retentionDays)*86400
 	for _, t := range tables {
-		if _, err := s.db.Exec(`DELETE FROM `+t+` WHERE ts < ?`, cutoff); err != nil {
+		if _, err := sqlite.DeleteBatched(s.db, t, "ts < ?", s.limits.WriteBatchRows, cutoff); err != nil {
 			log.Printf("[flowstore] prune %s: %v", t, err)
 		}
 	}

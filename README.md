@@ -617,21 +617,30 @@ capped at 1,000,000 rows. Set a value negative to keep data forever
 its effective settings and current SQLite footprint at startup so you can size
 retention against your disk.
 
-**Reclaiming disk (`detections.sqlite`).** Retention *deletes* rows on the
-1-minute cleanup ticker, but by default SQLite never returns freed pages to the
+**Reclaiming disk (`detections.sqlite`).** Scheduled retention *deletes* rows,
+but by default SQLite never returns freed pages to the
 OS — a file that once ballooned stays big, full of reusable free pages. argus
 keeps both halves in check through the `storage:` config section:
 
-- **WAL.** Every `wal_checkpoint_interval` (default 5m) argus runs
-  `PRAGMA wal_checkpoint(TRUNCATE)`, which waits for readers and shrinks the
-  `-wal` to zero. The PASSIVE autocheckpoint alone cannot reset the WAL while
-  the API keeps a constant read load on the pool. `journal_size_limit` (64 MiB)
-  is also set on every pooled connection.
+- **WAL.** Every `wal_checkpoint_interval` (default 5m) argus runs a PASSIVE
+  checkpoint before attempting TRUNCATE. The checked-out connection uses a
+  250ms busy timeout while waiting for readers, then restores its prior timeout.
+  A busy checkpoint is retried on the next tick; the timeout does not bound
+  total checkpoint I/O time. A successful TRUNCATE shrinks `-wal` to zero.
+  `journal_size_limit` (64 MiB) is also set on every pooled connection.
 - **Main file.** On the same tick argus runs
   `PRAGMA incremental_vacuum(incremental_vacuum_pages)` (default 2000 pages,
   about 8 MiB). This only works once the file has been converted to
   `auto_vacuum=INCREMENTAL`, which is a one-off offline step. argus logs a
   reminder once until the conversion is done.
+- **Retention batches.** `write_batch_rows` (default 5000; zero selects the
+  default, negative selects one unbatched DELETE) bounds each flowstore and
+  telemetry retention-delete transaction, with a short pause between chunks.
+  The same setting does **not** split detail persistence or daily rollup writes:
+  those stay atomic to preserve closed-bucket retry and publication guarantees.
+  Telemetry startup also skips rewriting history just restored from SQLite.
+  These controls concern the main database, not the separate `flows.sqlite`.
+  See [SQLite storage and maintenance](docs/sqlite-storage.md).
 
 To convert (and compact) an existing file, stop argus briefly. First dump the
 tiny live-state tables as insurance. Then run the conversion:

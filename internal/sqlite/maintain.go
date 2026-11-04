@@ -3,24 +3,55 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 )
 
-// CheckpointWAL runs a TRUNCATE checkpoint, which copies the WAL back into the
-// main file and shrinks the -wal to zero bytes. Unlike the PASSIVE
-// autocheckpoint it waits (up to busy_timeout) for readers to move past the
-// WAL, so it is the only thing that reliably bounds the -wal file while the
-// API keeps a constant read load on the pool.
-//
-// It returns busy=true when SQLite could not finish (a reader was still pinned);
+// CheckpointWAL runs PASSIVE before TRUNCATE to copy available WAL frames before
+// TRUNCATE takes the writer lock and tries to shrink the -wal file to zero bytes.
+// It returns busy=true when SQLite could not finish (for example, a pinned reader);
 // that is not an error, the next tick retries.
+//
+// A dedicated checked-out connection uses a short busy timeout so waiting for
+// readers does not hold the writer lock for the pool's full busy_timeout. This
+// limits busy-handler waiting, not the total checkpoint duration: copying frames
+// and disk I/O can take longer. The prior timeout is restored before reuse.
 func CheckpointWAL(ctx context.Context, db *sql.DB) (busy bool, walPages, moved int, err error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	defer conn.Close()
+	var prevTimeout int
+	if err = conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&prevTimeout); err != nil {
+		return false, 0, 0, err
+	}
+	defer func() {
+		// Cleanup must survive caller cancellation. Never return a connection with
+		// an altered timeout to the pool if restoration itself fails.
+		if _, restoreErr := conn.ExecContext(context.Background(), fmt.Sprintf(`PRAGMA busy_timeout=%d`, prevTimeout)); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore checkpoint busy_timeout: %w", restoreErr))
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+	if _, err = conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout=%d`, checkpointBusyTimeout.Milliseconds())); err != nil {
+		return false, 0, 0, err
+	}
+
 	var b int
-	err = db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&b, &walPages, &moved)
+	if err = conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&b, &walPages, &moved); err != nil {
+		return false, walPages, moved, err
+	}
+	err = conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&b, &walPages, &moved)
 	return b != 0, walPages, moved, err
 }
+
+// checkpointBusyTimeout limits busy-handler waiting during checkpoint lock
+// contention; it does not bound checkpoint I/O or total execution time.
+const checkpointBusyTimeout = 250 * time.Millisecond
 
 // IncrementalVacuum returns up to pages free pages to the OS. It is a no-op
 // unless the file has auto_vacuum=INCREMENTAL (2); it reports the mode so the
@@ -61,7 +92,11 @@ func StartMaintenance(ctx context.Context, db *sql.DB, interval time.Duration, v
 				return
 			case <-t.C:
 			}
+			start := time.Now()
 			busy, walPages, _, err := CheckpointWAL(ctx, db)
+			if d := time.Since(start); d > time.Second {
+				log.Printf("[SQLite] wal_checkpoint took %s (wal=%d pages)", d.Round(time.Millisecond), walPages)
+			}
 			switch {
 			case err != nil:
 				log.Printf("[SQLite] wal_checkpoint failed: %v", err)

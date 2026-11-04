@@ -90,6 +90,13 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   trims the table FIFO by id, mirroring `blackhole_events_max_rows`.
 
 ### Changed
+- **SQLite housekeeping improvements.** Avoid rewriting restored telemetry
+  history after startup, run PASSIVE before TRUNCATE checkpoints with a short
+  connection-local busy timeout, and batch flowstore/telemetry retention deletes.
+  `storage.write_batch_rows` defaults to 5000; negative keeps deletes unbatched.
+  Detail writes and daily rollups remain atomic, preserving closed-bucket retries
+  and lifetime totals. Telemetry schema/warmup errors stop startup rather than
+  continuing with a partial restore. See `docs/sqlite-storage.md`.
 - **ASN profile enrichment now uses RIPEstat (`stat.ripe.net`) instead of the
   unavailable BGPView API.** Organisation names, snapshot-observed prefixes and
   RIS-observed AS neighbours retain the existing profile JSON shape with
@@ -117,6 +124,10 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   is reclaimed with a one-time `VACUUM` (see README → Storage / disk).
 
 ### Fixed
+- **Daily IP rollups with changing country metadata.** Group by the daily table's
+  primary key rather than country, selecting `MAX(country)` deterministically.
+  This prevents duplicate-key errors blocking a day's rollup and subsequent
+  detail pruning, without changing the rollup's atomic transaction.
 - **Collector template panic and IPFIX framing.** Validate packet/set/template
   and data-record boundaries instead of trusting advertised counts and lengths;
   distinguish NetFlow v9 from native IPFIX/v10 framing. Invalid datagrams must

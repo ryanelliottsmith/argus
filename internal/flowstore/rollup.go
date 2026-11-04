@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"argus/internal/sqlite"
 )
 
 const (
@@ -235,13 +237,15 @@ func (s *Store) rollupOneDay(day int64) error {
 
 // rollIPs aggregates the 30-min top-IP rows for a day and keeps the top `limit`
 // per (asn, dir) by bytes. limit < 0 keeps all.
+// Group by the daily primary key, not country: a GeoIP change within the day
+// must not create duplicate daily keys. MAX(country) selects one deterministically.
 func rollIPs(tx *sql.Tx, day, start, end int64, limit int) error {
 	rows, err := tx.Query(`
-		SELECT asn, dir, peer_ip, local_ip, proto, dst_port, country,
+		SELECT asn, dir, peer_ip, local_ip, proto, dst_port, MAX(country),
 		       SUM(bytes), SUM(packets), SUM(flows)
 		FROM flowstore_top_ips
 		WHERE ts >= ? AND ts < ?
-		GROUP BY asn, dir, peer_ip, local_ip, proto, dst_port, country
+		GROUP BY asn, dir, peer_ip, local_ip, proto, dst_port
 		ORDER BY asn, dir, SUM(bytes) DESC`, start, end)
 	if err != nil {
 		return err
@@ -456,7 +460,7 @@ func (s *Store) pruneDaily() {
 	// Marker prune: only for days older than the largest possible scan window,
 	// so removing a marker can never cause a re-roll. Keeps the table bounded.
 	markerCutoff := today - int64(rollupMaxWindowDays+1)*daySeconds
-	if _, err := s.db.Exec(`DELETE FROM flowstore_rollup_done WHERE day < ?`, markerCutoff); err != nil {
+	if _, err := sqlite.DeleteBatched(s.db, "flowstore_rollup_done", "day < ?", s.limits.WriteBatchRows, markerCutoff); err != nil {
 		log.Printf("[flowstore] prune flowstore_rollup_done: %v", err)
 	}
 
@@ -469,7 +473,7 @@ func (s *Store) pruneDaily() {
 		"flowstore_daily_ips", "flowstore_daily_prefixes", "flowstore_daily_ports",
 		"flowstore_daily_country", "flowstore_daily_proto", "flowstore_daily_ip_totals",
 	} {
-		if _, err := s.db.Exec(`DELETE FROM `+t+` WHERE day < ?`, cutoff); err != nil {
+		if _, err := sqlite.DeleteBatched(s.db, t, "day < ?", s.limits.WriteBatchRows, cutoff); err != nil {
 			log.Printf("[flowstore] prune %s: %v", t, err)
 		}
 	}

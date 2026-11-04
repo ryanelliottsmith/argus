@@ -2,6 +2,7 @@ package config
 
 import (
 	"argus/internal/collectors"
+	"argus/internal/sqlite"
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"log"
@@ -228,6 +229,9 @@ type StorageConfig struct {
 	// PRAGMA incremental_vacuum. Only has an effect once the file has been
 	// converted with auto_vacuum=INCREMENTAL (see README). Default 2000.
 	IncrementalVacuumPages int `yaml:"incremental_vacuum_pages"`
+	// Rows per DELETE transaction for flowstore and telemetry retention.
+	// Zero uses the default (5000); negative uses one unbatched DELETE.
+	WriteBatchRows int `yaml:"write_batch_rows"`
 }
 
 // FlowLogConfig controls the optional raw flow log (ROADMAP Phase 2, Tier 0):
@@ -445,6 +449,7 @@ func applyStorageDefaults(cfg *Config) {
 	defDur(&cfg.Detection.AlertCooldown, 10*time.Minute)
 	defDur(&cfg.Storage.WALCheckpointInterval, 5*time.Minute)
 	defInt(&cfg.Storage.IncrementalVacuumPages, 2000)
+	defInt(&cfg.Storage.WriteBatchRows, sqlite.DefaultWriteBatchRows)
 
 	r := &cfg.Retention
 	defDur(&r.Detections, 90*24*time.Hour)
@@ -521,8 +526,8 @@ func LogStartup(cfg *Config) {
 		fs.TopIPs, fs.TopPrefixes, fs.TopPorts,
 		fs.MaxTrackedIPs, fs.MaxTrackedPrefixes, fs.MaxTrackedPorts,
 		tel.BucketRetentionDays)
-	log.Printf("[CFG] sqlite: wal_checkpoint_interval=%s incremental_vacuum_pages=%d",
-		cfg.Storage.WALCheckpointInterval, cfg.Storage.IncrementalVacuumPages)
+	log.Printf("[CFG] sqlite: wal_checkpoint_interval=%s incremental_vacuum_pages=%d write_batch_rows=%d",
+		cfg.Storage.WALCheckpointInterval, cfg.Storage.IncrementalVacuumPages, cfg.Storage.WriteBatchRows)
 	log.Printf("[CFG] retention: detections=%s alert_events=%s snapshots_daily=%s risk_events=%s (max_rows=%d) blackhole_events=%s (max_rows=%d)",
 		r.Detections, r.AlertEvents, r.SnapshotsDaily, r.RiskEvents, r.RiskEventsMaxRow, r.BlackholeEvents, r.BlackholeEventsMaxRow)
 

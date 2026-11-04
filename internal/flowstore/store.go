@@ -27,6 +27,7 @@ import (
 
 	"argus/internal/enrich"
 	"argus/internal/flowdir"
+	"argus/internal/sqlite"
 	"github.com/yl2chen/cidranger"
 )
 
@@ -72,6 +73,10 @@ type Settings struct {
 	MaxTrackedIPs         int // unique IP pairs tracked in RAM per bucket
 	MaxTrackedPrefixes    int
 	MaxTrackedPorts       int
+
+	// Rows per retention DELETE transaction (storage.write_batch_rows).
+	// Detail and daily rollup writes remain atomic; negative means unbatched deletes.
+	WriteBatchRows int
 }
 
 // DefaultSettings are the pre-Phase-1 hardcoded values (plus the Phase-2 daily
@@ -87,6 +92,7 @@ func DefaultSettings() Settings {
 		MaxTrackedIPs:         10000,
 		MaxTrackedPrefixes:    1000,
 		MaxTrackedPorts:       500,
+		WriteBatchRows:        sqlite.DefaultWriteBatchRows,
 	}
 }
 
@@ -108,6 +114,7 @@ func (st Settings) withDefaults() Settings {
 	def(&st.MaxTrackedIPs, d.MaxTrackedIPs)
 	def(&st.MaxTrackedPrefixes, d.MaxTrackedPrefixes)
 	def(&st.MaxTrackedPorts, d.MaxTrackedPorts)
+	def(&st.WriteBatchRows, d.WriteBatchRows)
 	return st
 }
 

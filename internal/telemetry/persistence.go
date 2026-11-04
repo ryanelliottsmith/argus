@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"log"
 	"time"
+
+	"argus/internal/sqlite"
 )
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -121,7 +123,7 @@ func WarmupRingFromDB(db *sql.DB) (int, error) {
 	for rows.Next() {
 		var b MinuteBucket
 		if err := rows.Scan(&b.Ts, &b.BytesIn, &b.BytesOut, &b.FlowsIn, &b.FlowsOut, &b.PktsIn, &b.PktsOut); err != nil {
-			continue
+			return loaded, err
 		}
 		slot := int((b.Ts / 60) % RingSize)
 		Global.ring[slot] = b
@@ -216,7 +218,7 @@ func WarmupASNRingFromDB(db *sql.DB) (int, error) {
 	for dbRows.Next() {
 		var r asnRow
 		if err := dbRows.Scan(&r.ts, &r.asn, &r.name, &r.bytesIn, &r.bytesOut, &r.flowsIn, &r.flowsOut); err != nil {
-			continue
+			return 0, err
 		}
 		buf = append(buf, r)
 	}
@@ -340,7 +342,7 @@ func WarmupIfaceRingFromDB(db *sql.DB) (int, error) {
 	for dbRows.Next() {
 		var r ifaceRow
 		if err := dbRows.Scan(&r.ts, &r.idx, &r.name, &r.bytesIn, &r.bytesOut, &r.flowsIn, &r.flowsOut); err != nil {
-			continue
+			return 0, err
 		}
 		buf = append(buf, r)
 	}
@@ -381,8 +383,9 @@ func WarmupIfaceRingFromDB(db *sql.DB) (int, error) {
 // ── Prune ─────────────────────────────────────────────────────────────────────
 
 // PruneOldBuckets deletes rows older than retentionDays from all three tables.
-// Negative retention disables pruning (keep forever).
-func PruneOldBuckets(db *sql.DB, retentionDays int) error {
+// Negative retention disables pruning (keep forever). batch is the maximum
+// rows per DELETE; zero uses the default and negative disables batching.
+func PruneOldBuckets(db *sql.DB, retentionDays, batch int) error {
 	if retentionDays < 0 {
 		return nil
 	}
@@ -392,7 +395,7 @@ func PruneOldBuckets(db *sql.DB, retentionDays int) error {
 		"telemetry_asn_buckets",
 		"telemetry_iface_buckets",
 	} {
-		if _, err := db.Exec(`DELETE FROM `+table+` WHERE ts < ?`, cutoff); err != nil {
+		if _, err := sqlite.DeleteBatched(db, table, "ts < ?", batch, cutoff); err != nil {
 			log.Printf("[telemetry] prune %s failed: %v", table, err)
 		}
 	}

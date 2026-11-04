@@ -370,12 +370,14 @@ func main() {
 	}
 	telemetry.Init(uint32(cfg.MyASN), myName, myNets, flowDir)
 
+	// The scheduler skips already-durable history on its first flush. Do not
+	// start it (or ingest) with an incomplete restore and silently skip data.
 	if err := telemetry.InitRingSchema(db); err != nil {
-		log.Printf("[telemetry] ring schema init failed: %v", err)
+		log.Fatalf("[telemetry] ring schema init failed: %v", err)
 	} else {
 		n, err := telemetry.WarmupRingFromDB(db)
 		if err != nil {
-			log.Printf("[telemetry] ring warmup failed: %v", err)
+			log.Fatalf("[telemetry] ring warmup failed: %v", err)
 		} else if n > 0 {
 			log.Printf("[telemetry] ring warmed up from DB: %d buckets (%.1f hours)",
 				n, float64(n)/60.0)
@@ -383,28 +385,28 @@ func main() {
 	}
 
 	if err := telemetry.InitASNRingSchema(db); err != nil {
-		log.Printf("[telemetry] ASN ring schema init failed: %v", err)
+		log.Fatalf("[telemetry] ASN ring schema init failed: %v", err)
 	} else {
 		n, err := telemetry.WarmupASNRingFromDB(db)
 		if err != nil {
-			log.Printf("[telemetry] ASN ring warmup failed: %v", err)
+			log.Fatalf("[telemetry] ASN ring warmup failed: %v", err)
 		} else if n > 0 {
 			log.Printf("[telemetry] ASN ring warmed up: %d slot×ASN entries", n)
 		}
 	}
 
 	if err := telemetry.InitIfaceRingSchema(db); err != nil {
-		log.Printf("[telemetry] iface ring schema init failed: %v", err)
+		log.Fatalf("[telemetry] iface ring schema init failed: %v", err)
 	} else {
 		n, err := telemetry.WarmupIfaceRingFromDB(db)
 		if err != nil {
-			log.Printf("[telemetry] iface ring warmup failed: %v", err)
+			log.Fatalf("[telemetry] iface ring warmup failed: %v", err)
 		} else if n > 0 {
 			log.Printf("[telemetry] iface ring warmed up: %d slot×iface entries", n)
 		}
 	}
 
-	telemetry.StartScheduler(ctx, db, cfg.Telemetry.BucketRetentionDays)
+	telemetry.StartScheduler(ctx, db, cfg.Telemetry.BucketRetentionDays, cfg.Storage.WriteBatchRows)
 	log.Printf("[telemetry] aggregator ready (myASN=%d nets=%d)", cfg.MyASN, len(myNets))
 
 	// ── FlowStore ─────────────────────────────────────────────────────────────
@@ -418,6 +420,7 @@ func main() {
 		MaxTrackedIPs:         cfg.Flowstore.MaxTrackedIPs,
 		MaxTrackedPrefixes:    cfg.Flowstore.MaxTrackedPrefixes,
 		MaxTrackedPorts:       cfg.Flowstore.MaxTrackedPorts,
+		WriteBatchRows:        cfg.Storage.WriteBatchRows,
 	}
 	var flowRanger cidranger.Ranger
 	if listener != nil {

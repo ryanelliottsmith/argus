@@ -247,7 +247,9 @@ func periodLabel(period string, ts int64) string {
 //
 // bucketRetentionDays controls how long the telemetry_*_buckets minute tables
 // are kept (wired from the `telemetry:` config section; negative = keep forever).
-func StartScheduler(ctx context.Context, db *sql.DB, bucketRetentionDays int) {
+// writeBatchRows controls rows per DELETE batch during minute-bucket pruning.
+// Call after all ring warmups succeed and before ingest starts.
+func StartScheduler(ctx context.Context, db *sql.DB, bucketRetentionDays, writeBatchRows int) {
 	if db == nil {
 		log.Print("[telemetry] scheduler: no DB, snapshots disabled")
 		return
@@ -277,8 +279,12 @@ func StartScheduler(ctx context.Context, db *sql.DB, bucketRetentionDays int) {
 	// the ones after it can change. Rewriting the whole 24h ring every tick
 	// meant ~1.5M INSERT OR REPLACE per flush for the ASN table alone — the
 	// write amplification behind a multi-GB WAL and a file that kept growing.
+	// Warmup restored these same tables before ingest started. Old minutes
+	// are already durable; keep one minute of overlap for a startup boundary.
+	// Capture this synchronously, before the caller can start ingesting.
+	initialSince := minEpoch(time.Now()) - 60
 	go func() {
-		var since int64 // 0 → the first flush writes the whole ring
+		since := initialSince
 		flush := func() {
 			start := minEpoch(time.Now())
 			ok := true
@@ -320,7 +326,7 @@ func StartScheduler(ctx context.Context, db *sql.DB, bucketRetentionDays int) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := PruneOldBuckets(db, bucketRetentionDays); err != nil {
+				if err := PruneOldBuckets(db, bucketRetentionDays, writeBatchRows); err != nil {
 					log.Printf("[telemetry] prune failed: %v", err)
 				}
 			}
