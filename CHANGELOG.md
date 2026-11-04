@@ -102,8 +102,8 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   RIS-observed AS neighbours retain the existing profile JSON shape with
   `ripestat` attribution. Country and IX presence remain explicitly unavailable;
   uncertain collector-only neighbours are excluded. Counts are calculated before
-  display-list truncation. See `docs/asn-enrichment.md` for semantics, verification
-  and the DNS/TCP 443 egress change; local flow collection and MaxMind are unchanged.
+  display-list truncation. See `docs/asn-enrichment.md` for provider semantics and
+  diagnostics; local flow collection and MaxMind are unchanged.
 - **Detection alerts are now incidents, not one block per second.** Rules
   re-evaluate every second over a sliding window, so a single scanner wrote the
   same alert block for as long as it stayed in the window. That added up to
@@ -132,9 +132,8 @@ Every behavior-changing PR must add an entry under **Unreleased**.
   and data-record boundaries instead of trusting advertised counts and lengths;
   distinguish NetFlow v9 from native IPFIX/v10 framing. Invalid datagrams must
   not crash or wedge collection, and valid exports larger than 1500 bytes are
-  no longer truncated by the old receive allocation. Verified locally with a
-  real-entrypoint UDP-to-SQLite regression reproducing the original panic. See
-  `docs/collector-decoder.md` for the draft's scope and exporter test procedure.
+  no longer truncated by the old receive allocation. See
+  `docs/collector-decoder.md` for supported formats and decoder limitations.
 - **Historical flowstore bucket totals were overwritten at non-boundary ticks.**
   Keep open 5-minute timeline/interface and 30-minute detail buckets in memory
   until closed, selecting top-N from the whole observed detail bucket. Failed
